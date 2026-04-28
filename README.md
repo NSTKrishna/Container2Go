@@ -2,6 +2,25 @@
 
 Container2Go is a minimal container runtime written in Go. It demonstrates Linux namespaces, cgroups, chroot, and process isolation by running commands in a lightweight container-like environment.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    A[User Terminal] --> B[container2go run bash]
+    B --> C[Parent Process run]
+    C -->|clone with namespaces| D[Child Process container]
+
+    D --> E[UTS Namespace<br/>custom hostname]
+    D --> F[PID Namespace<br/>PID 1 inside container]
+    D --> G[Mount Namespace<br/>isolated filesystem]
+    D --> H[chroot /home/liz/ubuntufs<br/>new root filesystem]
+    D --> I[Mount /proc]
+    D --> J[Mount tmpfs]
+    D --> K[cgroups<br/>limit processes]
+
+    D --> L[User Command bash]
+```
+
 ## Features
 
 - Process isolation using Linux namespaces (UTS, PID, mount)
