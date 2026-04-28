@@ -46,17 +46,25 @@ func child() {
 	cmd.Stderr = os.Stderr
 
 	must(syscall.Sethostname([]byte("container")))
-	syscall.Chroot("/home/ubuntu/ubuntufs")
+
+	// FIX 1: check chroot error
+	must(syscall.Chroot("/home/ubuntu/ubuntufs"))
 	must(os.Chdir("/"))
-	must(syscall.Mount("proc", "proc", "proc", 0, ""))
-	must(syscall.Mount("thing", "mytemp", "tmpfs", 0, ""))
-	
+
+	// FIX 2: ensure dirs exist
+	os.MkdirAll("/proc", 0755)
+	os.MkdirAll("/mytemp", 0755)
+
+	// FIX 3: correct mount paths
+	must(syscall.Mount("proc", "/proc", "proc", 0, ""))
+	must(syscall.Mount("tmpfs", "/mytemp", "tmpfs", 0, ""))
+
 	cg()
 
 	must(cmd.Run())
 
-	must(syscall.Unmount("proc", 0))
-	must(syscall.Unmount("thing", 0))
+	must(syscall.Unmount("/proc", 0))
+	must(syscall.Unmount("/mytemp", 0))
 }
 
 func cg() {
