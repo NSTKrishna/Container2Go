@@ -180,7 +180,8 @@ func main() {
 	// CORS Middleware to allow React frontend
 	corsMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "http://localhost:5173" || origin == "http://localhost:3000" {
+		if origin != "" {
+			// Reflect the origin back to allow credentials from any dev host
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
