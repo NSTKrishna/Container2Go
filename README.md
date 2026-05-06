@@ -1,310 +1,183 @@
-# MiniDocker (Container2Go)
+# MiniDocker — Browser-Based Container Platform
 
-A minimal container runtime written in Go that demonstrates Linux containerization concepts with full lifecycle management. Built for educational purposes to understand how tools like Docker work under the hood.
+MiniDocker is an educational, end-to-end browser-based multi-user container platform written in Go. It demonstrates how modern container runtimes (like Docker) and web-based IDEs (like GitHub Codespaces or Coder) work under the hood.
 
-## Architecture
+Users open a web browser, log in, and are instantly dropped into their own fully isolated, persistent Linux shell running on the host system.
+
+## High-Level Architecture
 
 ```mermaid
 flowchart TD
-    A[User Terminal] --> B{minidocker CLI}
-    B -->|run| C[run.go: Start Container]
-    B -->|ps| D[ps.go: List Containers]
-    B -->|stop| E[stop.go: Kill Container]
-    B -->|logs| F[logs.go: View Output]
-    B -->|child| G[child.go: Container Init]
+    A[Browser / xterm.js] <-->|WebSocket Binary Frames| B(Go HTTP Server)
+    
+    subgraph Go Backend
+        B <-->|Gorilla WebSocket| C[Manager]
+        C <-->|Reads/Writes| D[PTY Master]
+        D <-->|I/O| E[Container Process]
+    end
 
-    C -->|"fork + exec with namespaces"| G
-    C -->|"save metadata"| H[("/tmp/minidocker/<id>/")]
-
-    G --> I[UTS Namespace<br/>custom hostname]
-    G --> J[PID Namespace<br/>PID 1 inside container]
-    G --> K[Mount Namespace<br/>isolated filesystem]
-    G --> L[chroot /home/ubuntu/ubuntufs<br/>new root filesystem]
-    G --> M[Mount /proc]
-    G --> N[Mount tmpfs]
-    G --> O[cgroups<br/>limit processes]
-    G --> P[User Command]
-
-    D -->|"read metadata"| H
-    D -->|"probe PID"| Q["syscall.Kill(pid, 0)"]
-    E -->|"read metadata"| H
-    E -->|"SIGKILL"| R[Kill Process]
-    F -->|"read logs.txt"| H
+    subgraph Linux Container Isolation
+        E --> F[UTS Namespace (Hostname)]
+        E --> G[PID Namespace (PID 1)]
+        E --> H[Mount Namespace]
+        H --> I[chroot /tmp/minidocker/rootfs/user]
+        H --> J[Mount /proc & tmpfs]
+        E --> K[cgroups (Memory & PID Limits)]
+    end
 ```
 
 ## Features
 
-- **Process isolation** using Linux namespaces (UTS, PID, Mount)
-- **Filesystem isolation** via chroot to a dedicated root filesystem
-- **Resource limiting** with cgroups (PID count limit)
-- **Virtual filesystem mounts**: `/proc` and tmpfs inside containers
-- **Container lifecycle management**: run, ps, stop, logs
-- **Metadata persistence** in JSON format
-- **Background execution** — containers run detached
-- **Log capture** — stdout/stderr saved to file
-- **PID tracking** — live process monitoring
+- **Multi-User**: Each authenticated user gets their own dedicated container.
+- **Web Terminal**: Full interactive terminal in the browser using `xterm.js` and WebSockets.
+- **PTY Support**: Interactive shell (`/bin/bash`) with job control, tab completion, and proper signal handling.
+- **Persistence**: Sessions survive browser disconnects. If you close the tab and reopen it, you reconnect to the exact same shell.
+- **Filesystem Isolation**: Each user gets a dedicated cloned Ubuntu rootfs via `chroot`.
+- **Resource Limits**: Configured via cgroups v1 (Limits to 20 PIDs and 100MB RAM per container).
+- **Process Isolation**: Linux Namespaces (UTS, PID, Mount) ensure users cannot see or interact with host processes or other containers.
 
 ## Project Structure
 
+The project has been modernized into a clean Go architecture:
+
 ```
-Container2Go/
-├── main.go        # CLI entrypoint — routes commands
-├── run.go         # run command — spawns container in background
-├── child.go       # child process — sets up namespaces, chroot, mounts
-├── ps.go          # ps command — lists containers with live status
-├── stop.go        # stop command — kills container by ID
-├── logs.go        # logs command — prints captured output
-├── container.go   # Container struct + metadata helpers (JSON)
-├── cgroup.go      # cgroup setup for resource limiting
-├── utils.go       # Utility functions (must, generateID)
-├── go.mod         # Go module definition
-├── README.md      # This file
-└── LICENSE
+cmd/
+├── server/main.go        # HTTP Server: Serves UI, auth, and WebSocket bridge
+└── cli/main.go           # CLI Tool: Standalone container management (backward compatible)
+
+internal/
+├── runtime/              # Low-level Linux primitives
+│   ├── container.go      # Metadata persistence
+│   ├── child.go          # Child process init (namespaces, chroot, mounts)
+│   ├── cgroup.go         # Resource limits
+│   └── runtime.go        # Lifecycle manager
+├── manager/
+│   └── manager.go        # Orchestrates users, PTYs, and rootfs provisioning
+├── websocket/
+│   └── handler.go        # WebSocket <-> PTY bidirectional bridge
+└── auth/
+    └── auth.go           # In-memory session and user management
+
+frontend/
+├── index.html            # Login UI
+├── terminal.html         # Web Terminal UI
+├── style.css             # Dark theme styles
 ```
 
-## Requirements
+---
 
-### Linux Requirements
+## Detailed Component Breakdown
 
-This runtime uses Linux-specific features and **must run on Linux**:
+### 1. The PTY Bridge (Pseudo-Terminal)
 
-| Feature | Kernel Requirement |
-|---|---|
-| PID namespaces | `CONFIG_PID_NS` |
-| UTS namespaces | `CONFIG_UTS_NS` |
-| Mount namespaces | `CONFIG_NAMESPACES` |
-| cgroups v1 | `/sys/fs/cgroup/pids/` must exist |
-| chroot | Standard syscall |
-| proc filesystem | Standard Linux |
+**Why not standard pipes?**
+Standard pipes (`stdin`, `stdout`) only move raw bytes. An interactive terminal requires a PTY (Pseudo-Terminal) to provide:
+- **Line Discipline**: Translating `Ctrl+C` into a `SIGINT` signal, or handling `EOF`.
+- **Size Awareness**: Programs like `vim` or `htop` need to know the exact terminal dimensions (rows/cols) to render correctly.
+- **Job Control**: Running processes in the background/foreground.
 
-### Root Privileges
+**How it works**:
+We use `github.com/creack/pty`. When the backend starts a container, it creates a PTY master/slave pair. The slave is attached to the container's `/bin/bash` process. The Go server holds the master file descriptor. The WebSocket handler reads keystrokes from the browser and writes them to the PTY master, and reads output from the PTY master and sends it to the browser.
 
-**Root access is required** (`sudo`) because:
+### 2. WebSocket Terminal Streaming
 
-1. **Creating namespaces** — `CLONE_NEWUTS`, `CLONE_NEWPID`, `CLONE_NEWNS` require `CAP_SYS_ADMIN`
-2. **chroot** — Only root can change the root directory
-3. **Mounting filesystems** — Mounting `/proc` and `tmpfs` requires root
-4. **cgroups** — Writing to `/sys/fs/cgroup/` requires root
-5. **Killing processes** — `SIGKILL` to container processes requires appropriate privileges
+The frontend uses `xterm.js`. 
+- **Input**: When a user types, `xterm.js` fires an event. The browser sends this data as a raw **Binary WebSocket Frame** to the Go server, which writes it to the PTY.
+- **Output**: The Go server continuously reads from the PTY master. When data appears (e.g., the output of `ls`), it sends it as a Binary Frame back to the browser, which `xterm.js` renders.
+- **Resizing**: When the browser window resizes, the frontend sends a **Text JSON Frame** (`{"type":"resize", "rows": 24, "cols": 80}`). The Go server intercepts this and sends an `ioctl` syscall (`TIOCSWINSZ`) to the PTY to update the shell's dimensions.
 
-### Root Filesystem
+### 3. Container Isolation (Linux Namespaces)
 
-You need an Ubuntu (or similar) root filesystem at `/home/ubuntu/ubuntufs`. Create one with:
+When the server creates a container, it re-executes its own binary with the command `child` and passes specific clone flags:
 
-```sh
-# Using debootstrap:
+- `CLONE_NEWUTS`: Isolates the hostname. The container sets its hostname to `container`.
+- `CLONE_NEWPID`: Isolates the process ID tree. The bash shell becomes `PID 1` inside the container.
+- `CLONE_NEWNS`: Isolates mounts. 
+  - We `chroot` into a dedicated rootfs (`/tmp/minidocker/rootfs/<user>`).
+  - We mount `/proc` so tools like `ps` work correctly, but only show containerized processes.
+  - We mount a `tmpfs` at `/mytemp` for fast, ephemeral scratch space.
+
+### 4. Resource Limiting (cgroups)
+
+We utilize Linux control groups (cgroups) to prevent a single user from crashing the host:
+- **PIDs Controller**: Capped at `20` processes. This prevents fork bombs (`:(){ :|:& };:`).
+- **Memory Controller**: Capped at `100MB`. Prevents the container from consuming all host RAM.
+
+### 5. Persistent Sessions & Manager
+
+The `internal/manager` package maps a `username` to a specific container ID and holds the active PTY session. 
+- If the WebSocket disconnects (user closes the tab), the Go server simply stops piping data. **The container and the bash process stay running in the background.**
+- When the user logs back in, the manager reconnects the new WebSocket to the *existing* PTY session.
+
+---
+
+## Installation & Setup
+
+### Requirements
+- **Linux OS** (Ubuntu recommended). This relies on Linux-specific syscalls (Namespaces, cgroups, chroot).
+- **Go 1.21+**
+- **Root Privileges** (`sudo` is required to create namespaces and mounts).
+
+### 1. Provision a Base Rootfs
+You need an uncompressed Linux filesystem to act as the base for the containers. We will use `debootstrap` to download a minimal Ubuntu filesystem.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y debootstrap
+
+# Download Ubuntu Focal (20.04) rootfs
+sudo mkdir -p /home/ubuntu/ubuntufs
 sudo debootstrap focal /home/ubuntu/ubuntufs http://archive.ubuntu.com/ubuntu
-
-# Or download a pre-built rootfs:
-mkdir -p /home/ubuntu/ubuntufs
-curl -L https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.1-base-amd64.tar.gz | sudo tar xz -C /home/ubuntu/ubuntufs
 ```
 
-### Software Requirements
+### 2. Build the Project
 
-- Go 1.21+ (for building)
-- Linux kernel 3.8+ (for namespace support)
-
-## Build Instructions
-
-```sh
-# Clone the repository
-git clone <repo-url>
+```bash
+git clone <your-repo>
 cd Container2Go
 
-# Build the binary
-go build -o minidocker .
+# Install dependencies
+go mod tidy
 
-# The binary must be run on Linux with root privileges
-sudo ./minidocker <command>
+# Build the Web Server
+GOOS=linux GOARCH=amd64 go build -o minidocker-server ./cmd/server/
+
+# Build the CLI (optional)
+GOOS=linux GOARCH=amd64 go build -o minidocker-cli ./cmd/cli/
 ```
 
-## Usage
+### 3. Run the Server
 
-### Run a Container
-
-Start a new container running a command:
-
-```sh
-sudo ./minidocker run /bin/sh
-sudo ./minidocker run /bin/bash
-sudo ./minidocker run /bin/ls -la
+```bash
+sudo ./minidocker-server
 ```
 
-Output:
-```
-Starting container a1b2c3d4
-Container a1b2c3d4 started (PID: 12345)
-```
+1. Open your browser and navigate to `http://<your-linux-vm-ip>:8080`.
+2. Log in using one of the demo accounts:
+   - `alice` / `password`
+   - `bob` / `password`
+   - `admin` / `admin`
+3. You are now inside a fully functional, isolated Ubuntu container!
 
-The container runs in the background. Output is captured to a log file.
+---
 
-### List Containers
+## Security Notes & Limitations
 
-View all containers and their status:
+> [!CAUTION]
+> **This project is educational. DO NOT expose this to the public internet without significant hardening.**
 
-```sh
-sudo ./minidocker ps
-```
+While this project utilizes namespaces and cgroups, it lacks several critical security boundaries found in production runtimes like Docker:
 
-Output:
-```
-ID          PID     STATUS     COMMAND
-a1b2c3d4    12345   running    /bin/sh
-e5f6a7b8    12400   exited     /bin/ls -la
-```
-
-### Stop a Container
-
-Terminate a running container:
-
-```sh
-sudo ./minidocker stop a1b2c3d4
-```
-
-Output:
-```
-Container a1b2c3d4 stopped.
-```
-
-### View Logs
-
-Print captured stdout/stderr from a container:
-
-```sh
-sudo ./minidocker logs a1b2c3d4
-```
-
-## How It Works
-
-### Container Lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Running : minidocker run
-    Running --> Exited : process exits naturally
-    Running --> Stopped : minidocker stop
-    Exited --> [*]
-    Stopped --> [*]
-```
-
-1. **`run`** — generates a unique ID, creates metadata dir at `/tmp/minidocker/<id>/`, opens `logs.txt`, re-executes the binary with `child` in new namespaces via `cmd.Start()` (non-blocking), saves PID + metadata to `config.json`
-2. **Container runs** — the `child` process sets up hostname, chroot, mounts, cgroups, then executes the user's command
-3. **`ps`** — reads all `config.json` files, probes each PID to check liveness
-4. **`stop`** — sends `SIGKILL` to the container PID, updates status
-5. **`logs`** — reads and prints the `logs.txt` file
-
-### PID Tracking
-
-The runtime tracks container processes using their host PIDs:
-
-1. When `run` calls `cmd.Start()`, Go records the child process PID
-2. This PID is saved to `config.json` in the container's metadata directory
-3. The `ps` command checks if each PID is alive using `syscall.Kill(pid, 0)`:
-   - **Signal 0** is a special signal that doesn't actually send anything — it just checks if the process exists and we have permission to signal it
-   - If `Kill` returns `nil`, the process is alive → status stays `"running"`
-   - If `Kill` returns an error, the process is dead → status updates to `"exited"`
-4. The `stop` command uses `syscall.Kill(pid, SIGKILL)` to forcefully terminate the process
-
-### How `ps` Works (Step by Step)
-
-1. Read all subdirectories from `/tmp/minidocker/`
-2. For each directory, load `config.json` into a `Container` struct
-3. For each container with `status == "running"`:
-   - Call `syscall.Kill(pid, 0)` to probe the process
-   - If error → process is dead, update status to `"exited"`, save metadata
-4. Format and print a table using Go's `tabwriter` for aligned columns
-
-### How `stop` Works (Step by Step)
-
-1. Parse the container ID from command-line arguments
-2. Load the container's `config.json` metadata
-3. Check if status is already `"stopped"` or `"exited"` → inform user and return
-4. Call `syscall.Kill(pid, syscall.SIGKILL)` to terminate the process
-   - `SIGKILL` (signal 9) cannot be caught, blocked, or ignored
-   - This guarantees the process will be terminated
-5. Update the container's status to `"stopped"` in `config.json`
-6. Save the updated metadata
-
-### Logging System
-
-Container output is captured by redirecting stdout and stderr:
-
-1. When `run` creates the child process, it opens `/tmp/minidocker/<id>/logs.txt`
-2. Instead of connecting the child's stdout/stderr to the terminal, they are connected to this log file: `cmd.Stdout = logFile` and `cmd.Stderr = logFile`
-3. Everything the container prints (including setup messages from `child()`) is written to the log file
-4. The `logs` command simply reads this file with `os.ReadFile()` and prints it
-5. The log file persists even after the container exits, so you can always review output
-
-### Metadata Storage
-
-Each container stores its state in `/tmp/minidocker/<container-id>/`:
-
-```
-/tmp/minidocker/a1b2c3d4/
-├── config.json    # Container metadata (ID, PID, command, status, log path)
-└── logs.txt       # Captured stdout/stderr output
-```
-
-Example `config.json`:
-```json
-{
-  "id": "a1b2c3d4",
-  "pid": 12345,
-  "command": "/bin/sh",
-  "status": "running",
-  "log_file": "/tmp/minidocker/a1b2c3d4/logs.txt"
-}
-```
-
-### Namespace Isolation
-
-The runtime creates three Linux namespaces for each container:
-
-| Flag | Namespace | Effect |
-|---|---|---|
-| `CLONE_NEWUTS` | UTS | Container gets its own hostname ("container") |
-| `CLONE_NEWPID` | PID | Container sees its own PID 1 (init process) |
-| `CLONE_NEWNS` | Mount | Mount/unmount operations are invisible to host |
-
-The `Unshareflags: CLONE_NEWNS` ensures mount event propagation is disabled, so mounting `/proc` inside the container doesn't affect the host.
+1. **No User Namespaces (`CLONE_NEWUSER`)**: The processes inside the container are running as `root` on the host. We use `chroot` to hide the host filesystem, but `chroot` is notoriously easy to escape if you have root privileges. Implementing user namespaces would map the container's `root` user to an unprivileged user on the host.
+2. **No Capability Dropping**: The container retains all Linux capabilities (e.g., `CAP_SYS_ADMIN`). A malicious user could potentially load kernel modules or manipulate host networking. Docker drops most capabilities by default.
+3. **No Seccomp Profiles**: The container can make any syscall to the host kernel.
+4. **Network Isolation**: Currently, containers share the host's network stack. To isolate networking, we would need to implement `CLONE_NEWNET`, create `veth` (virtual ethernet) pairs, and attach them to a host bridge with NAT rules configured via `iptables`.
 
 ## Future Improvements
 
-### Detached Containers
-Currently the parent process exits after starting a container. A daemon architecture (like Docker's `dockerd`) could manage long-running containers, handle restarts, and provide a persistent API.
+If you want to take this project further, consider implementing:
 
-### Exec Support
-Add `minidocker exec <id> <command>` to run additional commands inside a running container by entering its existing namespaces using `setns()`.
-
-### Networking
-Add network namespaces (`CLONE_NEWNET`) with virtual ethernet pairs (`veth`) to give containers their own network stack with configurable port forwarding.
-
-### OverlayFS
-Replace chroot with OverlayFS to support layered filesystems. This enables copy-on-write, shared base images, and efficient storage — the same approach Docker uses.
-
-### Image Management
-Add support for pulling and managing container images (rootfs tarballs), with commands like `minidocker pull ubuntu` and `minidocker images`.
-
-### OCI Runtime Compatibility
-Evolve toward the [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec) to become compatible with container orchestrators like Kubernetes and Podman.
-
-### Daemon Architecture
-Implement a client-server model where a background daemon (`minidockerd`) manages containers, and the CLI communicates via a Unix socket or REST API.
-
-### Resource Limits
-Extend cgroup support beyond PID limits to include:
-- **Memory limits** — prevent containers from exhausting host RAM
-- **CPU limits** — restrict CPU time allocation
-- **I/O limits** — throttle disk read/write speeds
-
-### User Namespaces
-Add `CLONE_NEWUSER` to run containers without requiring root privileges on the host, mapping container root (UID 0) to an unprivileged host user.
-
-## Disclaimer
-
-This project is for **educational purposes only**. It is not a secure or production-ready container runtime. Do not use it to run untrusted workloads.
-
-## License
-
-See [LICENSE](LICENSE) for details.
+- **Network Isolation**: Implement `CLONE_NEWNET` and auto-provision `veth` interfaces for each container.
+- **OverlayFS**: Currently, we use `cp -a` to copy the entire rootfs for every user. This is slow and consumes massive disk space. Using `OverlayFS` would allow all users to share a single read-only base image, writing only their modifications to a thin "upper" layer.
+- **OCI Compliance**: Refactor the runtime execution to accept OCI (Open Container Initiative) standard `config.json` files, making the runtime compatible with Kubernetes or Podman.
+- **MicroVMs**: For true multi-tenant security, replace Linux namespaces with hardware-virtualized MicroVMs using Firecracker (this is how AWS Lambda and Fly.io work).
