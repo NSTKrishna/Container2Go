@@ -2,83 +2,60 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
-	"syscall"
 )
 
-// go run main.go run <cmd> <args>
+// MiniDocker — A minimal container runtime with lifecycle management.
+//
+// This is an educational container runtime that demonstrates:
+//   - Linux namespaces (UTS, PID, Mount) for process isolation
+//   - chroot for filesystem isolation
+//   - cgroups for resource limiting (PID count)
+//   - proc and tmpfs mounting inside containers
+//   - Container lifecycle: run, ps, stop, logs
+//
+// Usage:
+//   minidocker run <command> [args...]   — Start a new container
+//   minidocker ps                        — List all containers
+//   minidocker stop <container-id>       — Stop a running container
+//   minidocker logs <container-id>       — View container logs
+//
+// Requirements:
+//   - Linux with root privileges
+//   - A root filesystem at /home/ubuntu/ubuntufs
 func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
 	switch os.Args[1] {
 	case "run":
 		run()
 	case "child":
+		// Internal command — called by run() to set up the container.
+		// This is not meant to be called directly by the user.
 		child()
+	case "ps":
+		ps()
+	case "stop":
+		stop()
+	case "logs":
+		logs()
 	default:
-		panic("help")
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", os.Args[1])
+		printUsage()
+		os.Exit(1)
 	}
 }
 
-func run() {
-	fmt.Printf("Running %v \n", os.Args[2:])
-
-	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:   syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
-		Unshareflags: syscall.CLONE_NEWNS,
-	}
-
-	must(cmd.Run())
-}
-
-func child() {
-	fmt.Printf("Running %v \n", os.Args[2:])
-
-	cmd := exec.Command(os.Args[2], os.Args[3:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	must(syscall.Sethostname([]byte("container")))
-
-	// FIX 1: check chroot error
-	must(syscall.Chroot("/home/ubuntu/ubuntufs"))
-	must(os.Chdir("/"))
-
-	// FIX 2: ensure dirs exist
-	os.MkdirAll("/proc", 0755)
-	os.MkdirAll("/mytemp", 0755)
-
-	// FIX 3: correct mount paths
-	must(syscall.Mount("proc", "/proc", "proc", 0, ""))
-	must(syscall.Mount("tmpfs", "/mytemp", "tmpfs", 0, ""))
-
-	cg()
-
-	must(cmd.Run())
-
-	must(syscall.Unmount("/proc", 0))
-	must(syscall.Unmount("/mytemp", 0))
-}
-
-func cg() {
-	cgroups := "/sys/fs/cgroup/"
-	pids := filepath.Join(cgroups, "pids")
-	os.MkdirAll(filepath.Join(pids, "liz"), 0755)
-	must(ioutil.WriteFile(filepath.Join(pids, "liz/pids.max"), []byte("20"), 0700))
-	// Removes the new cgroup in place after the container exits
-	must(ioutil.WriteFile(filepath.Join(pids, "liz/notify_on_release"), []byte("1"), 0700))
-	must(ioutil.WriteFile(filepath.Join(pids, "liz/cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0700))
-}
-
-func must(err error) {
-	if err != nil {
-		panic(err)
-	}
+// printUsage displays the help message with all available commands.
+func printUsage() {
+	fmt.Println("MiniDocker — A minimal container runtime")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  minidocker run <command> [args...]   Start a new container")
+	fmt.Println("  minidocker ps                        List all containers")
+	fmt.Println("  minidocker stop <container-id>       Stop a running container")
+	fmt.Println("  minidocker logs <container-id>       View container logs")
 }
