@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="MiniDocker — Interactive container terminal">
+    <title>MiniDocker — Terminal</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Loading overlay — shown while container is being created -->
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="spinner"></div>
+        <div class="loading-text" id="loading-text">Initializing container...</div>
+    </div>
+
+    <div class="terminal-page">
+        <!-- Top status bar -->
+        <div class="top-bar">
+            <div class="top-bar-left">
+                <span class="top-bar-logo">🐳 MiniDocker</span>
+                <span class="status-badge connecting" id="status-badge">
+                    <span class="status-dot"></span>
+                    <span id="status-text">connecting</span>
+                </span>
+                <span class="user-info" id="container-info"></span>
+            </div>
+            <div class="top-bar-right">
+                <span class="user-info" id="user-info"></span>
+                <button class="btn btn-danger" id="logout-btn">Logout</button>
+            </div>
+        </div>
+
+        <!-- Terminal -->
+        <div class="terminal-wrapper">
+            <div id="terminal"></div>
+        </div>
+
+        <!-- Bottom info bar -->
+        <div class="bottom-bar">
+            <span id="terminal-size">--x--</span>
+            <span>Press Ctrl+D to exit shell · Container persists on disconnect</span>
+        </div>
+    </div>
+
+    <!-- xterm.js from CDN -->
+    <script type="module">
+        import { Terminal } from 'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm';
+        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm';
+
+        // ---- State ----
+        let ws = null;
+        let containerID = null;
+        let term = null;
+        let fitAddon = null;
+
+        // ---- UI Elements ----
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const loadingText = document.getElementById('loading-text');
+        const statusBadge = document.getElementById('status-badge');
+        const statusText = document.getElementById('status-text');
+        const containerInfo = document.getElementById('container-info');
+        const terminalSize = document.getElementById('terminal-size');
+        const logoutBtn = document.getElementById('logout-btn');
+
+        // ---- Initialize ----
+        async function init() {
+            // 1. Create or get existing container
+            loadingText.textContent = 'Creating container...';
+            try {
+                const res = await fetch('/api/containers', { method: 'POST' });
+                if (res.status === 401) {
+                    window.location.href = '/';
+                    return;
+                }
+                const container = await res.json();
+                if (container.error) {
+                    loadingText.textContent = 'Error: ' + container.error;
+                    return;
+                }
+                containerID = container.id;
+                containerInfo.textContent = 'ID: ' + containerID;
+            } catch (err) {
+                loadingText.textContent = 'Failed to create container: ' + err.message;
+                return;
+            }
+
+            // 2. Initialize xterm.js
+            loadingText.textContent = 'Starting terminal...';
+            setupTerminal();
+
+            // 3. Connect WebSocket
+            connectWebSocket();
+        }
+
+        function setupTerminal() {
+            term = new Terminal({
+                cursorBlink: true,
+                fontSize: 15,
+                fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+                theme: {
+                    background: '#0d1117',
+                    foreground: '#e6edf3',
+                    cursor: '#58a6ff',
+                    cursorAccent: '#0d1117',
+                    selectionBackground: 'rgba(88, 166, 255, 0.3)',
+                    black: '#484f58',
+                    red: '#ff7b72',
+                    green: '#3fb950',
+                    yellow: '#d29922',
+                    blue: '#58a6ff',
+                    magenta: '#bc8cff',
+                    cyan: '#39d353',
+                    white: '#b1bac4',
+                    brightBlack: '#6e7681',
+                    brightRed: '#ffa198',
+                    brightGreen: '#56d364',
+                    brightYellow: '#e3b341',
+                    brightBlue: '#79c0ff',
+                    brightMagenta: '#d2a8ff',
+                    brightCyan: '#56d364',
+                    brightWhite: '#f0f6fc',
+                },
+                allowProposedApi: true,
+            });
+
+            fitAddon = new FitAddon();
+            term.loadAddon(fitAddon);
+
+            term.open(document.getElementById('terminal'));
+            fitAddon.fit();
+
+            // Send user input to WebSocket as binary
+            term.onData((data) => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // Convert string to Uint8Array for binary transmission
+                    const encoder = new TextEncoder();
+                    ws.send(encoder.encode(data));
+                }
+            });
+
+            // Handle window resize
+            window.addEventListener('resize', () => {
+                fitAddon.fit();
+            });
+
+            term.onResize(({ rows, cols }) => {
+                terminalSize.textContent = cols + 'x' + rows;
+                // Send resize command to server as text JSON
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'resize', rows, cols }));
+                }
+            });
+
+            terminalSize.textContent = term.cols + 'x' + term.rows;
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = protocol + '//' + window.location.host + '/ws/' + containerID;
+
+            setStatus('connecting');
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                setStatus('running');
+                loadingOverlay.classList.add('hidden');
+                term.focus();
+
+                // Send initial resize
+                fitAddon.fit();
+                ws.send(JSON.stringify({
+                    type: 'resize',
+                    rows: term.rows,
+                    cols: term.cols,
+                }));
+            };
+
+            ws.onmessage = (event) => {
+                // Receive container output and write to terminal
+                if (event.data instanceof ArrayBuffer) {
+                    const decoder = new TextDecoder();
+                    term.write(decoder.decode(event.data));
+                } else {
+                    term.write(event.data);
+                }
+            };
+
+            ws.onclose = () => {
+                setStatus('disconnected');
+                term.write('\r\n\x1b[33m[Connection closed. Press Enter to reconnect]\x1b[0m\r\n');
+
+                // Auto-reconnect after 3 seconds
+                setTimeout(() => {
+                    if (!ws || ws.readyState === WebSocket.CLOSED) {
+                        term.write('\x1b[33m[Reconnecting...]\x1b[0m\r\n');
+                        connectWebSocket();
+                    }
+                }, 3000);
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                setStatus('disconnected');
+            };
+        }
+
+        function setStatus(status) {
+            statusBadge.className = 'status-badge ' + status;
+            statusText.textContent = status;
+        }
+
+        // ---- Logout ----
+        logoutBtn.addEventListener('click', async () => {
+            await fetch('/api/logout', { method: 'POST' });
+            if (ws) ws.close();
+            window.location.href = '/';
+        });
+
+        // ---- Start ----
+        init();
+    </script>
+</body>
+</html>
