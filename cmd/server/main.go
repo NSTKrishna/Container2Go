@@ -53,40 +53,8 @@ func main() {
 		Manager: mgr,
 	}
 
-	// Determine frontend directory path
-	execPath, _ := os.Executable()
-	baseDir := filepath.Dir(execPath)
-	frontendDir := filepath.Join(baseDir, "frontend")
-
-	// Fallback: check if frontend is in current working directory
-	if _, err := os.Stat(frontendDir); os.IsNotExist(err) {
-		cwd, _ := os.Getwd()
-		frontendDir = filepath.Join(cwd, "frontend")
-	}
-
-	log.Printf("Serving frontend from: %s", frontendDir)
-
 	// --- Routes ---
 	mux := http.NewServeMux()
-
-	// Static frontend files
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
-			return
-		}
-		if r.URL.Path == "/terminal" || r.URL.Path == "/terminal.html" {
-			// Require auth for terminal page
-			if _, err := authService.GetUsernameFromRequest(r); err != nil {
-				http.Redirect(w, r, "/", http.StatusSeeOther)
-				return
-			}
-			http.ServeFile(w, r, filepath.Join(frontendDir, "terminal.html"))
-			return
-		}
-		// Serve other static files (CSS, JS)
-		http.ServeFile(w, r, filepath.Join(frontendDir, r.URL.Path))
-	})
 
 	// --- Auth API ---
 	mux.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
@@ -209,10 +177,27 @@ func main() {
 	// --- WebSocket terminal ---
 	mux.HandleFunc("/ws/", wsH.ServeWS)
 
+	// CORS Middleware to allow React frontend
+	corsMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "http://localhost:5173" || origin == "http://localhost:3000" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	// --- Start server ---
 	server := &http.Server{
 		Addr:         ":8080",
-		Handler:      mux,
+		Handler:      corsMux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
