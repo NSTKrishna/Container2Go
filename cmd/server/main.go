@@ -83,6 +83,7 @@ func main() {
 			Value:    token,
 			Path:     "/",
 			HttpOnly: true,
+			SameSite: http.SameSiteNoneMode,
 			MaxAge:   86400, // 24 hours
 		})
 
