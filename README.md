@@ -8,21 +8,23 @@ Users open a web browser, log in, and are instantly dropped into their own fully
 
 ```mermaid
 flowchart TD
-    A[Browser / xterm.js] <-->|WebSocket Binary Frames| B(Go HTTP Server)
-    
-    subgraph Go Backend
-        B <-->|Gorilla WebSocket| C[Manager]
-        C <-->|Reads/Writes| D[PTY Master]
-        D <-->|I/O| E[Container Process]
+    A["Client Browser<br/>xterm.js Terminal"] <-->|WebSocket Binary Frames| B["Go HTTP Server"]
+
+    subgraph Backend["Go Backend"]
+        B <-->|Gorilla WebSocket| C["Session Manager"]
+        C <-->|Read / Write Streams| D["PTY Master"]
+        D <-->|STDIN / STDOUT / STDERR| E["Container Shell Process"]
     end
 
-    subgraph Linux Container Isolation
-        E --> F[UTS Namespace (Hostname)]
-        E --> G[PID Namespace (PID 1)]
-        E --> H[Mount Namespace]
-        H --> I[chroot /tmp/minidocker/rootfs/user]
-        H --> J[Mount /proc & tmpfs]
-        E --> K[cgroups (Memory & PID Limits)]
+    subgraph Isolation["Linux Container Isolation"]
+        E --> F["UTS Namespace<br/>Isolated Hostname"]
+        E --> G["PID Namespace<br/>Independent Process Tree"]
+
+        E --> H["Mount Namespace"]
+        H --> I["chroot RootFS<br/>/tmp/minidocker/rootfs/user"]
+        H --> J["Mounted /proc and tmpfs"]
+
+        E --> K["cgroups<br/>Memory + PID Limits"]
     end
 ```
 
